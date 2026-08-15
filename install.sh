@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT_VERSION="v13"
+SCRIPT_VERSION="v14"
 
 # ------------------------------------------------------------
 # 3x-ui + VLESS + XHTTP + REALITY installer (v13, Xray pinned, ML-DSA disabled)
@@ -394,7 +394,7 @@ PAYLOAD="$(jq -nc \
       xhttpSettings: {
         path: $path,
         host: "",
-        mode: "auto"
+        mode: "stream-one"
       }
     },
     sniffing: {
@@ -468,9 +468,16 @@ fi
 [[ "$VLESS_LINK" == vless://* ]] || die "3x-ui вернул некорректную VLESS ссылку"
 [[ "$VLESS_LINK" != *$'\n'* && "$VLESS_LINK" != *$'\r'* ]] || die "VLESS URI содержит перевод строки"
 if [[ "$VLESS_LINK" == *"pqv="* ]]; then
-  die "Диагностическая v12 ожидала ссылку без pqv, но 3x-ui вернул pqv"
+  die "Диагностическая v14 ожидала ссылку без pqv, но 3x-ui вернул pqv"
 fi
 ok "Share-link без pqv/ML-DSA-65"
+
+if [[ "$VLESS_LINK" != *"mode=stream-one"* ]]; then
+  echo "---- VLESS link from 3x-ui ----" >&2
+  printf '%s\n' "$VLESS_LINK" >&2
+  die "3x-ui share-link не содержит mode=stream-one"
+fi
+ok "XHTTP share-link использует mode=stream-one"
 
 printf '%s\n' "$VLESS_LINK" > /root/vless.txt
 chmod 600 /root/vless.txt
