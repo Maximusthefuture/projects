@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT_VERSION="v11"
+SCRIPT_VERSION="v12"
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v11)
+# 3x-ui + VLESS + XHTTP + REALITY installer (v12, ML-DSA disabled)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -198,7 +198,7 @@ esac
 XRAY="/usr/local/x-ui/bin/xray-linux-${XRAY_ARCH}"
 [[ -x "$XRAY" ]] || die "Xray binary не найден: $XRAY"
 
-log "Генерирую UUID и REALITY ключи через API 3x-ui"
+log "Генерирую UUID и X25519 REALITY ключи через API 3x-ui"
 UUID="$($XRAY uuid | head -n1 | tr -d '[:space:]')"
 [[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || UUID="$(cat /proc/sys/kernel/random/uuid)"
 
@@ -229,55 +229,32 @@ if [[ ${#PRIVATE_KEY} -ne 43 || ${#PUBLIC_KEY} -ne 43 ]]; then
 fi
 ok "X25519 ключи сгенерированы через 3x-ui API"
 
-MLDSA_JSON="$(api_get '/panel/api/server/getNewmldsa65')" \
-  || die "3x-ui API: не удалось сгенерировать ML-DSA-65 ключи"
-
-if [[ "$(jq -r '.success // false' <<<"$MLDSA_JSON")" != "true" ]]; then
-  echo "$MLDSA_JSON" | jq . 2>/dev/null || echo "$MLDSA_JSON"
-  die "3x-ui API не сгенерировал ML-DSA-65 ключи"
-fi
-
-MLDSA_SEED="$(jq -r '.obj.seed // empty' <<<"$MLDSA_JSON")"
-MLDSA_VERIFY="$(jq -r '.obj.verify // empty' <<<"$MLDSA_JSON")"
-
-if [[ -z "$MLDSA_SEED" || -z "$MLDSA_VERIFY" ]]; then
-  echo "3x-ui ML-DSA-65 API diagnostics:" >&2
-  echo "  seed length: ${#MLDSA_SEED}" >&2
-  echo "  verify length: ${#MLDSA_VERIFY}" >&2
-  die "Некорректный ответ getNewmldsa65"
-fi
-ok "ML-DSA-65 ключи сгенерированы через 3x-ui API"
-
 SHORT_ID="$(openssl rand -hex 2)"
 CLIENT_EMAIL="client-$(openssl rand -hex 3)"
 SUB_ID="$(random_alnum 20)"
 
-# With ML-DSA-65, REALITY target certificate chain should be > 3500 bytes.
+# Without ML-DSA-65 we only require a successful TLS handshake to the REALITY target.
 check_sni() {
-  local domain="$1" out cert_len
+  local domain="$1" out
   out="$($XRAY tls ping "$domain" 2>&1 || true)"
-  cert_len="$(awk -F': +' '/Certificate chain.s total length:/ {print $2}' <<<"$out" | awk '{print $1}' | tail -n1)"
-  [[ "$cert_len" =~ ^[0-9]+$ ]] || return 1
-  (( cert_len > 3500 )) || return 1
-  grep -q "Handshake succeeded" <<<"$out" || return 1
-  echo "$cert_len"
+  grep -q "Handshake succeeded" <<<"$out"
 }
 
 if [[ -n "${SNI:-}" ]]; then
   log "Проверяю указанный REALITY SNI: $SNI"
-  CERT_LEN="$(check_sni "$SNI")" || die "SNI '$SNI' не прошёл проверку для ML-DSA-65 (нужен успешный TLS handshake и chain > 3500 bytes)"
+  check_sni "$SNI" || die "SNI '$SNI' не прошёл TLS handshake"
 else
   SNI=""
   for candidate in google.com github.io; do
     log "Проверяю REALITY target: $candidate"
-    if CERT_LEN="$(check_sni "$candidate")"; then
+    if check_sni "$candidate"; then
       SNI="$candidate"
       break
     fi
   done
   [[ -n "$SNI" ]] || die "Не нашёл подходящий REALITY target. Запусти с SNI=your-domain.example"
 fi
-ok "REALITY target: ${SNI}:443, certificate chain: ${CERT_LEN} bytes"
+ok "REALITY target: ${SNI}:443"
 REALITY_TARGET="${SNI}:443"
 
 if [[ -n "${INBOUND_PORT:-}" ]]; then
@@ -299,8 +276,6 @@ PAYLOAD="$(jq -nc \
   --arg privateKey "$PRIVATE_KEY" \
   --arg publicKey "$PUBLIC_KEY" \
   --arg sid "$SHORT_ID" \
-  --arg seed "$MLDSA_SEED" \
-  --arg verify "$MLDSA_VERIFY" \
   --arg remark "$REMARK" \
   --arg subId "$SUB_ID" \
   '{
@@ -341,13 +316,11 @@ PAYLOAD="$(jq -nc \
         maxClientVer: "",
         maxTimediff: 0,
         shortIds: [$sid],
-        mldsa65Seed: $seed,
         settings: {
           publicKey: $publicKey,
           fingerprint: "chrome",
           serverName: $sni,
-          spiderX: "/",
-          mldsa65Verify: $verify
+          spiderX: "/"
         }
       },
       xhttpSettings: {
@@ -426,6 +399,10 @@ fi
 
 [[ "$VLESS_LINK" == vless://* ]] || die "3x-ui вернул некорректную VLESS ссылку"
 [[ "$VLESS_LINK" != *$'\n'* && "$VLESS_LINK" != *$'\r'* ]] || die "VLESS URI содержит перевод строки"
+if [[ "$VLESS_LINK" == *"pqv="* ]]; then
+  die "Диагностическая v12 ожидала ссылку без pqv, но 3x-ui вернул pqv"
+fi
+ok "Share-link без pqv/ML-DSA-65"
 
 printf '%s\n' "$VLESS_LINK" > /root/vless.txt
 chmod 600 /root/vless.txt
@@ -488,7 +465,7 @@ ${VLESS_LINK}
   Security:   REALITY
   SNI:        ${SNI}
   Short ID:   ${SHORT_ID}
-  ML-DSA-65:  enabled
+  ML-DSA-65:  disabled (v12 diagnostic)
 
 3x-ui установлен, но web-панель слушает только 127.0.0.1.
 Для доступа с компьютера сделай SSH tunnel:
