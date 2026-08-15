@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT_VERSION="v12"
+SCRIPT_VERSION="v13"
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY installer (v12, ML-DSA disabled)
+# 3x-ui + VLESS + XHTTP + REALITY installer (v13, Xray pinned, ML-DSA disabled)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
 #   XUI_VERSION=v3.6.0
+#   XRAY_VERSION=26.6.27
 #   SNI=google.com
 #   INBOUND_PORT=55207
 #   XHTTP_PATH=/
@@ -17,6 +18,7 @@ SCRIPT_VERSION="v12"
 # ------------------------------------------------------------
 
 XUI_VERSION="${XUI_VERSION:-v3.6.0}"
+XRAY_VERSION="${XRAY_VERSION:-26.6.27}"
 XHTTP_PATH="${XHTTP_PATH:-/}"
 REMARK="${REMARK:-vless-xhttp-reality}"
 [[ "$XHTTP_PATH" == /* ]] || XHTTP_PATH="/$XHTTP_PATH"
@@ -197,6 +199,72 @@ case "$(uname -m)" in
 esac
 XRAY="/usr/local/x-ui/bin/xray-linux-${XRAY_ARCH}"
 [[ -x "$XRAY" ]] || die "Xray binary не найден: $XRAY"
+
+get_xray_version() {
+  "$XRAY" version 2>/dev/null     | head -n1     | sed -E 's/^Xray[[:space:]]+v?([^[:space:]]+).*/\1/'
+}
+
+wait_for_panel_api() {
+  local ready=0
+  for _ in $(seq 1 60); do
+    if systemctl is-active --quiet x-ui &&        curl -sS --max-time 2 -o /dev/null "${API_BASE}/" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  (( ready == 1 ))
+}
+
+CURRENT_XRAY_VERSION="$(get_xray_version || true)"
+if [[ "$CURRENT_XRAY_VERSION" == "$XRAY_VERSION" ]]; then
+  ok "Xray уже нужной версии: ${XRAY_VERSION}"
+else
+  log "Фиксирую Xray-core ${XRAY_VERSION} (сейчас: ${CURRENT_XRAY_VERSION:-unknown})"
+
+  XRAY_INSTALL_RESPONSE=""
+  XRAY_INSTALL_OK=0
+  for version_arg in "$XRAY_VERSION" "v${XRAY_VERSION}"; do
+    XRAY_INSTALL_RESPONSE="$(curl -sS --max-time 180       -X POST "${API_BASE}/panel/api/server/installXray/${version_arg}"       -H "Authorization: Bearer ${XUI_API_TOKEN}"       -H 'Accept: application/json' 2>/dev/null || true)"
+
+    if [[ "$(jq -r '.success // false' <<<"$XRAY_INSTALL_RESPONSE" 2>/dev/null)" == "true" ]]; then
+      XRAY_INSTALL_OK=1
+      break
+    fi
+  done
+
+  if (( XRAY_INSTALL_OK == 0 )); then
+    echo "---- installXray API response ----" >&2
+    if jq . >/dev/null 2>&1 <<<"$XRAY_INSTALL_RESPONSE"; then
+      jq . <<<"$XRAY_INSTALL_RESPONSE" >&2
+    else
+      printf '%s\n' "$XRAY_INSTALL_RESPONSE" >&2
+    fi
+    die "3x-ui API не смог установить Xray-core ${XRAY_VERSION}"
+  fi
+
+  # Ensure the panel launches the freshly installed external binary.
+  systemctl restart x-ui
+  log "Жду перезапуска 3x-ui после смены Xray-core"
+  if ! wait_for_panel_api; then
+    journalctl -u x-ui -n 80 --no-pager >&2 || true
+    die "3x-ui API не поднялся после установки Xray-core ${XRAY_VERSION}"
+  fi
+
+  # Wait until the replaced binary reports exactly the requested version.
+  XRAY_VERSION_OK=0
+  for _ in $(seq 1 30); do
+    CURRENT_XRAY_VERSION="$(get_xray_version || true)"
+    if [[ "$CURRENT_XRAY_VERSION" == "$XRAY_VERSION" ]]; then
+      XRAY_VERSION_OK=1
+      break
+    fi
+    sleep 1
+  done
+
+  (( XRAY_VERSION_OK == 1 )) || die "Ожидался Xray ${XRAY_VERSION}, но установлен ${CURRENT_XRAY_VERSION:-unknown}"
+  ok "Xray-core зафиксирован на ${CURRENT_XRAY_VERSION}"
+fi
 
 log "Генерирую UUID и X25519 REALITY ключи через API 3x-ui"
 UUID="$($XRAY uuid | head -n1 | tr -d '[:space:]')"
@@ -465,7 +533,8 @@ ${VLESS_LINK}
   Security:   REALITY
   SNI:        ${SNI}
   Short ID:   ${SHORT_ID}
-  ML-DSA-65:  disabled (v12 diagnostic)
+  ML-DSA-65:  disabled (v13 diagnostic)
+  Xray-core:   ${CURRENT_XRAY_VERSION}
 
 3x-ui установлен, но web-панель слушает только 127.0.0.1.
 Для доступа с компьютера сделай SSH tunnel:
