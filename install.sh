@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT_VERSION="v8"
+SCRIPT_VERSION="v11"
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v8)
+# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v11)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -52,10 +52,40 @@ if [[ -e /etc/x-ui/x-ui.db || -x "$XUI_BIN" ]]; then
   log "3x-ui уже установлен — пропускаю установку и продолжаю настройку inbound"
 fi
 
-log "Устанавливаю зависимости"
+log "Проверяю зависимости"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y curl jq openssl ca-certificates iproute2
+
+missing_packages=()
+command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
+command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+command -v ip >/dev/null 2>&1 || missing_packages+=(iproute2)
+dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'ok installed' || missing_packages+=(ca-certificates)
+
+wait_for_apt() {
+  local waited=0
+  while pgrep -f '(^|/)(unattended-upgrade|apt-get|apt|dpkg)( |$)' >/dev/null 2>&1; do
+    if (( waited == 0 )); then
+      log "apt/dpkg сейчас занят системным обновлением — жду освобождения блокировки"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    if (( waited >= 300 )); then
+      ps -ef | grep -E '[u]nattended-upgrade|[a]pt-get|[d]pkg' >&2 || true
+      die "apt/dpkg остаётся занят более 5 минут. Не удаляй lock-файлы вручную."
+    fi
+  done
+}
+
+if (( ${#missing_packages[@]} > 0 )); then
+  log "Не хватает пакетов: ${missing_packages[*]}"
+  wait_for_apt
+  apt-get update -y
+  wait_for_apt
+  apt-get install -y "${missing_packages[@]}"
+else
+  ok "Все зависимости уже установлены — apt не запускаю"
+fi
 
 random_alnum() {
   local len="$1" raw
@@ -220,6 +250,7 @@ ok "ML-DSA-65 ключи сгенерированы через 3x-ui API"
 
 SHORT_ID="$(openssl rand -hex 2)"
 CLIENT_EMAIL="client-$(openssl rand -hex 3)"
+SUB_ID="$(random_alnum 20)"
 
 # With ML-DSA-65, REALITY target certificate chain should be > 3500 bytes.
 check_sni() {
@@ -271,6 +302,7 @@ PAYLOAD="$(jq -nc \
   --arg seed "$MLDSA_SEED" \
   --arg verify "$MLDSA_VERIFY" \
   --arg remark "$REMARK" \
+  --arg subId "$SUB_ID" \
   '{
     enable: true,
     remark: $remark,
@@ -289,7 +321,7 @@ PAYLOAD="$(jq -nc \
         expiryTime: 0,
         enable: true,
         tgId: 0,
-        subId: "",
+        subId: $subId,
         reset: 0
       }],
       decryption: "none",
@@ -321,12 +353,7 @@ PAYLOAD="$(jq -nc \
       xhttpSettings: {
         path: $path,
         host: "",
-        mode: "auto",
-        xPaddingBytes: "100-1000",
-        scMaxEachPostBytes: "1000000",
-        scMaxBufferedPosts: 30,
-        scStreamUpServerSecs: "20-80",
-        headers: {}
+        mode: "auto"
       }
     },
     sniffing: {
@@ -365,18 +392,44 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: 
   ok "UFW: открыт TCP/${INBOUND_PORT}"
 fi
 
-urlencode() {
-  jq -nr --arg v "$1" '$v|@uri'
-}
+# Ask 3x-ui itself for the client share-link. This is the same backend path
+# used by the panel's Client Information/share-link flow.
+log "Получаю VLESS share-link у 3x-ui API"
 
-PATH_ENC="$(urlencode "$XHTTP_PATH")"
-REMARK_ENC="$(urlencode "$REMARK")"
-SPX_ENC="%2F"
+SUBLINK_RESPONSE=""
+VLESS_LINK=""
+for _ in $(seq 1 10); do
+  SUBLINK_RESPONSE="$(curl -fsS --max-time 15 \
+    -H "Authorization: Bearer ${XUI_API_TOKEN}" \
+    -H 'Accept: application/json' \
+    -H "Host: ${SERVER_IP}" \
+    "${API_BASE}/panel/api/clients/subLinks/${SUB_ID}" 2>/dev/null || true)"
 
-VLESS_LINK="vless://${UUID}@${SERVER_IP}:${INBOUND_PORT}?type=xhttp&encryption=none&path=${PATH_ENC}&host=&mode=auto&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&spx=${SPX_ENC}&pqv=${MLDSA_VERIFY}#${REMARK_ENC}"
+  # Response shape has changed across 3x-ui revisions. Extract the first
+  # vless:// string recursively instead of depending on a particular .obj shape.
+  VLESS_LINK="$(jq -r '.. | strings | select(startswith("vless://"))' \
+    <<<"$SUBLINK_RESPONSE" 2>/dev/null | head -n1 || true)"
+
+  [[ -n "$VLESS_LINK" ]] && break
+  sleep 1
+done
+
+if [[ -z "$VLESS_LINK" ]]; then
+  echo "---- 3x-ui subLinks API response ----" >&2
+  if jq . >/dev/null 2>&1 <<<"$SUBLINK_RESPONSE"; then
+    jq . <<<"$SUBLINK_RESPONSE" >&2
+  else
+    printf '%s\n' "$SUBLINK_RESPONSE" >&2
+  fi
+  die "3x-ui API не вернул vless:// share-link для subId=${SUB_ID}"
+fi
+
+[[ "$VLESS_LINK" == vless://* ]] || die "3x-ui вернул некорректную VLESS ссылку"
+[[ "$VLESS_LINK" != *$'\n'* && "$VLESS_LINK" != *$'\r'* ]] || die "VLESS URI содержит перевод строки"
 
 printf '%s\n' "$VLESS_LINK" > /root/vless.txt
 chmod 600 /root/vless.txt
+ok "VLESS ссылка получена непосредственно от 3x-ui API"
 
 # Optional Telegram delivery. Do not hardcode the bot token in a public repo.
 send_vless_to_telegram() {
@@ -428,6 +481,7 @@ ${VLESS_LINK}
   Server:     ${SERVER_IP}
   Port:       ${INBOUND_PORT}
   UUID:       ${UUID}
+  Sub ID:     ${SUB_ID}
   Transport:  XHTTP
   Path:       ${XHTTP_PATH}
   Mode:       auto
