@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v2)
+# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v3)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -150,30 +150,43 @@ log "Генерирую UUID и REALITY ключи"
 UUID="$($XRAY uuid | head -n1 | tr -d '[:space:]')"
 [[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || UUID="$(cat /proc/sys/kernel/random/uuid)"
 
-# Xray CLI output is not a stable machine-readable API. Capture stderr too and
-# support both the old labels (Private key/Public key) and the newer
-# labels (PrivateKey/Password/Hash32).
+# Xray CLI output is not a stable machine-readable API. Capture stderr too.
+# New Xray versions print PrivateKey/Password/Hash32, older ones used
+# Private key/Public key. Normalize terminal control characters first and
+# parse by label without depending on awk field-separator behaviour.
+clean_xray_output() {
+  # Strip CR and common ANSI CSI escape sequences.
+  sed $'s/\r//g; s/\033\[[0-9;?]*[ -\/]*[@-~]//g'
+}
+
+extract_xray_value() {
+  local labels_re="$1"
+  local input="$2"
+  printf '%s\n' "$input" \
+    | clean_xray_output \
+    | sed -nE "/^[[:space:]]*(${labels_re})[[:space:]]*:/I { s/^[^:]*:[[:space:]]*//; s/[[:space:]]+$//; p; }"
+}
+
+valid_xray_key() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{20,}$ ]]
+}
+
 X25519_OUT="$("$XRAY" x25519 2>&1 || true)"
-PRIVATE_KEY="$(awk -F':[[:space:]]*' '
-  { key=tolower($1) }
-  key=="privatekey" || key=="private key" {print $2; exit}
-' <<<"$X25519_OUT")"
-PUBLIC_KEY="$(awk -F':[[:space:]]*' '
-  { key=tolower($1) }
-  key=="password" || key=="public key" || key=="publickey" {print $2; exit}
-' <<<"$X25519_OUT")"
-if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+PRIVATE_KEY="$(extract_xray_value 'PrivateKey|Private[[:space:]]+key' "$X25519_OUT")"
+PUBLIC_KEY="$(extract_xray_value 'Password|PublicKey|Public[[:space:]]+key' "$X25519_OUT")"
+
+if ! valid_xray_key "$PRIVATE_KEY" || ! valid_xray_key "$PUBLIC_KEY"; then
   echo "xray x25519 labels:" >&2
-  sed -E 's/^([^:]+):.*/  \1: <hidden>/' <<<"$X25519_OUT" >&2
+  printf '%s\n' "$X25519_OUT" | clean_xray_output | sed -E 's/^([^:]+):.*/  \1: <hidden>/' >&2
   die "Не удалось распарсить xray x25519"
 fi
 
 MLDSA_OUT="$("$XRAY" mldsa65 2>&1 || true)"
-MLDSA_SEED="$(awk -F':[[:space:]]*' 'tolower($1)=="seed" {print $2; exit}' <<<"$MLDSA_OUT")"
-MLDSA_VERIFY="$(awk -F':[[:space:]]*' 'tolower($1)=="verify" {print $2; exit}' <<<"$MLDSA_OUT")"
-if [[ -z "$MLDSA_SEED" || -z "$MLDSA_VERIFY" ]]; then
+MLDSA_SEED="$(extract_xray_value 'Seed' "$MLDSA_OUT")"
+MLDSA_VERIFY="$(extract_xray_value 'Verify' "$MLDSA_OUT")"
+if ! valid_xray_key "$MLDSA_SEED" || ! valid_xray_key "$MLDSA_VERIFY"; then
   echo "xray mldsa65 labels:" >&2
-  sed -E 's/^([^:]+):.*/  \1: <hidden>/' <<<"$MLDSA_OUT" >&2
+  printf '%s\n' "$MLDSA_OUT" | clean_xray_output | sed -E 's/^([^:]+):.*/  \1: <hidden>/' >&2
   die "Не удалось распарсить xray mldsa65"
 fi
 
