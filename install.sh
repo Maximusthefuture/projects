@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v5)
+# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v6)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -134,13 +134,29 @@ log "Привязываю web-панель к localhost"
 "$XUI_BIN" setting -listenIP "127.0.0.1" >/dev/null
 systemctl restart x-ui
 
-for _ in $(seq 1 30); do
+# systemd may report "active" before the web server has actually bound its socket.
+# Wait for both the service and a real HTTP connection to the localhost panel.
+log "Жду запуска API 3x-ui на 127.0.0.1:${XUI_PANEL_PORT}"
+PANEL_READY=0
+for _ in $(seq 1 60); do
   if systemctl is-active --quiet x-ui; then
-    break
+    # Any HTTP status is enough here; we only verify that the socket accepts connections.
+    if curl -sS --max-time 2 -o /dev/null "${API_BASE}/" 2>/dev/null; then
+      PANEL_READY=1
+      break
+    fi
   fi
   sleep 1
 done
-systemctl is-active --quiet x-ui || die "x-ui не запустился"
+
+if (( PANEL_READY == 0 )); then
+  echo "---- ss diagnostics ----" >&2
+  ss -ltnp 2>/dev/null | grep -E ":${XUI_PANEL_PORT}([[:space:]]|$)" >&2 || true
+  echo "---- x-ui logs ----" >&2
+  journalctl -u x-ui -n 80 --no-pager >&2 || true
+  die "3x-ui service запущен, но API на 127.0.0.1:${XUI_PANEL_PORT} не стал доступен за 60 секунд"
+fi
+ok "3x-ui API доступен на 127.0.0.1:${XUI_PANEL_PORT}"
 
 case "$(uname -m)" in
   x86_64|amd64) XRAY_ARCH="amd64" ;;
@@ -156,7 +172,7 @@ UUID="$($XRAY uuid | head -n1 | tr -d '[:space:]')"
 
 api_get() {
   local path="$1"
-  curl -fsS --max-time 15 \
+  curl -fsS --retry 5 --retry-delay 1 --retry-connrefused --max-time 15 \
     -H "Authorization: Bearer ${XUI_API_TOKEN}" \
     -H 'Accept: application/json' \
     "${API_BASE}${path}"
