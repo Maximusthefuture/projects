@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer
+# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v2)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -11,6 +11,8 @@ set -Eeuo pipefail
 #   INBOUND_PORT=55207
 #   XHTTP_PATH=/
 #   REMARK=my-server
+#   TELEGRAM_BOT_TOKEN=123456789:AA...
+#   TELEGRAM_CHAT_ID=123456789
 # ------------------------------------------------------------
 
 XUI_VERSION="${XUI_VERSION:-v3.6.0}"
@@ -42,8 +44,10 @@ case "${ID:-}" in
   *) die "Эта версия скрипта рассчитана на Ubuntu/Debian. Обнаружено: ${ID:-unknown}" ;;
 esac
 
+XUI_ALREADY_INSTALLED=0
 if [[ -e /etc/x-ui/x-ui.db || -x "$XUI_BIN" ]]; then
-  die "3x-ui уже установлен. Эта версия установщика рассчитана на чистый VPS, чтобы случайно не затереть существующую конфигурацию."
+  XUI_ALREADY_INSTALLED=1
+  log "3x-ui уже установлен — пропускаю установку и продолжаю настройку inbound"
 fi
 
 log "Устанавливаю зависимости"
@@ -88,26 +92,30 @@ done
 [[ -n "$SERVER_IP" ]] || die "Не удалось определить публичный IPv4 сервера"
 ok "Публичный IP: $SERVER_IP"
 
-PANEL_USER="$(random_alnum 12)"
-PANEL_PASS="$(random_alnum 20)"
-PANEL_PATH="$(random_alnum 20)"
-PANEL_PORT="$(random_free_port)" || die "Не удалось подобрать свободный порт панели"
+if (( XUI_ALREADY_INSTALLED == 0 )); then
+  PANEL_USER="$(random_alnum 12)"
+  PANEL_PASS="$(random_alnum 20)"
+  PANEL_PATH="$(random_alnum 20)"
+  PANEL_PORT="$(random_free_port)" || die "Не удалось подобрать свободный порт панели"
 
-log "Устанавливаю 3x-ui ${XUI_VERSION} через официальный installer"
-curl -fsSL "$OFFICIAL_INSTALLER" | env \
-  XUI_NONINTERACTIVE=1 \
-  XUI_USERNAME="$PANEL_USER" \
-  XUI_PASSWORD="$PANEL_PASS" \
-  XUI_PANEL_PORT="$PANEL_PORT" \
-  XUI_WEB_BASE_PATH="$PANEL_PATH" \
-  XUI_SSL_MODE=none \
-  XUI_DB_TYPE=sqlite \
-  XUI_ENABLE_FAIL2BAN=false \
-  XUI_SERVER_IP="$SERVER_IP" \
-  bash -s -- "$XUI_VERSION"
+  log "Устанавливаю 3x-ui ${XUI_VERSION} через официальный installer"
+  curl -fsSL "$OFFICIAL_INSTALLER" | env \
+    XUI_NONINTERACTIVE=1 \
+    XUI_USERNAME="$PANEL_USER" \
+    XUI_PASSWORD="$PANEL_PASS" \
+    XUI_PANEL_PORT="$PANEL_PORT" \
+    XUI_WEB_BASE_PATH="$PANEL_PATH" \
+    XUI_SSL_MODE=none \
+    XUI_DB_TYPE=sqlite \
+    XUI_ENABLE_FAIL2BAN=false \
+    XUI_SERVER_IP="$SERVER_IP" \
+    bash -s -- "$XUI_VERSION"
+else
+  ok "Использую существующий 3x-ui"
+fi
 
-[[ -x "$XUI_BIN" ]] || die "3x-ui не установился: $XUI_BIN отсутствует"
-[[ -r "$INSTALL_RESULT" ]] || die "Не найден $INSTALL_RESULT"
+[[ -x "$XUI_BIN" ]] || die "3x-ui не найден: $XUI_BIN отсутствует"
+[[ -r "$INSTALL_RESULT" ]] || die "Не найден $INSTALL_RESULT (нужен API token от установки 3x-ui)"
 
 # The official installer writes shell-escaped values here with mode 600.
 # shellcheck disable=SC1090
@@ -142,15 +150,32 @@ log "Генерирую UUID и REALITY ключи"
 UUID="$($XRAY uuid | head -n1 | tr -d '[:space:]')"
 [[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || UUID="$(cat /proc/sys/kernel/random/uuid)"
 
-X25519_OUT="$($XRAY x25519)"
-PRIVATE_KEY="$(awk -F':[[:space:]]*' '/^PrivateKey:/ {print $2; exit}' <<<"$X25519_OUT")"
-PUBLIC_KEY="$(awk -F':[[:space:]]*' '/^Password:/ {print $2; exit}' <<<"$X25519_OUT")"
-[[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || die "Не удалось распарсить xray x25519"
+# Xray CLI output is not a stable machine-readable API. Capture stderr too and
+# support both the old labels (Private key/Public key) and the newer
+# labels (PrivateKey/Password/Hash32).
+X25519_OUT="$("$XRAY" x25519 2>&1 || true)"
+PRIVATE_KEY="$(awk -F':[[:space:]]*' '
+  { key=tolower($1) }
+  key=="privatekey" || key=="private key" {print $2; exit}
+' <<<"$X25519_OUT")"
+PUBLIC_KEY="$(awk -F':[[:space:]]*' '
+  { key=tolower($1) }
+  key=="password" || key=="public key" || key=="publickey" {print $2; exit}
+' <<<"$X25519_OUT")"
+if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+  echo "xray x25519 labels:" >&2
+  sed -E 's/^([^:]+):.*/  \1: <hidden>/' <<<"$X25519_OUT" >&2
+  die "Не удалось распарсить xray x25519"
+fi
 
-MLDSA_OUT="$($XRAY mldsa65)"
-MLDSA_SEED="$(awk -F':[[:space:]]*' '/^Seed:/ {print $2; exit}' <<<"$MLDSA_OUT")"
-MLDSA_VERIFY="$(awk -F':[[:space:]]*' '/^Verify:/ {print $2; exit}' <<<"$MLDSA_OUT")"
-[[ -n "$MLDSA_SEED" && -n "$MLDSA_VERIFY" ]] || die "Не удалось распарсить xray mldsa65"
+MLDSA_OUT="$("$XRAY" mldsa65 2>&1 || true)"
+MLDSA_SEED="$(awk -F':[[:space:]]*' 'tolower($1)=="seed" {print $2; exit}' <<<"$MLDSA_OUT")"
+MLDSA_VERIFY="$(awk -F':[[:space:]]*' 'tolower($1)=="verify" {print $2; exit}' <<<"$MLDSA_OUT")"
+if [[ -z "$MLDSA_SEED" || -z "$MLDSA_VERIFY" ]]; then
+  echo "xray mldsa65 labels:" >&2
+  sed -E 's/^([^:]+):.*/  \1: <hidden>/' <<<"$MLDSA_OUT" >&2
+  die "Не удалось распарсить xray mldsa65"
+fi
 
 SHORT_ID="$(openssl rand -hex 2)"
 CLIENT_EMAIL="client-$(openssl rand -hex 3)"
@@ -243,7 +268,7 @@ PAYLOAD="$(jq -nc \
         target: $target,
         serverNames: [$sni],
         privateKey: $privateKey,
-        minClientVer: "26.3.27",
+        minClientVer: "",
         maxClientVer: "",
         maxTimediff: 0,
         shortIds: [$sid],
@@ -315,6 +340,39 @@ VLESS_LINK="vless://${UUID}@${SERVER_IP}:${INBOUND_PORT}?type=xhttp&encryption=n
 
 printf '%s\n' "$VLESS_LINK" > /root/vless.txt
 chmod 600 /root/vless.txt
+
+# Optional Telegram delivery. Do not hardcode the bot token in a public repo.
+send_vless_to_telegram() {
+  local response
+
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+    warn "Telegram: нужны обе переменные TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID; отправка пропущена"
+    return 0
+  fi
+
+  log "Отправляю VLESS ссылку в Telegram"
+
+  response="$(curl -fsS --max-time 15 \
+    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${VLESS_LINK}" \
+    2>/dev/null)" || {
+      warn "Telegram: не удалось отправить VLESS ссылку"
+      return 0
+    }
+
+  if [[ "$(jq -r '.ok // false' <<<"$response" 2>/dev/null)" == "true" ]]; then
+    ok "VLESS ссылка отправлена в Telegram"
+  else
+    warn "Telegram API не подтвердил отправку ссылки"
+  fi
+}
+
+send_vless_to_telegram
 
 cat <<EOF
 
