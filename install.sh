@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v3)
+# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v5)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -125,6 +125,10 @@ source "$INSTALL_RESULT"
 : "${XUI_WEB_BASE_PATH:?XUI_WEB_BASE_PATH missing}"
 : "${XUI_API_TOKEN:?XUI_API_TOKEN missing}"
 
+BASE_PATH="${XUI_WEB_BASE_PATH#/}"
+BASE_PATH="${BASE_PATH%/}"
+API_BASE="http://127.0.0.1:${XUI_PANEL_PORT}/${BASE_PATH}"
+
 # Do not expose the plain-HTTP admin panel to the Internet.
 log "Привязываю web-панель к localhost"
 "$XUI_BIN" setting -listenIP "127.0.0.1" >/dev/null
@@ -146,49 +150,55 @@ esac
 XRAY="/usr/local/x-ui/bin/xray-linux-${XRAY_ARCH}"
 [[ -x "$XRAY" ]] || die "Xray binary не найден: $XRAY"
 
-log "Генерирую UUID и REALITY ключи"
+log "Генерирую UUID и REALITY ключи через API 3x-ui"
 UUID="$($XRAY uuid | head -n1 | tr -d '[:space:]')"
 [[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || UUID="$(cat /proc/sys/kernel/random/uuid)"
 
-# Xray CLI output is not a stable machine-readable API. Capture stderr too.
-# New Xray versions print PrivateKey/Password/Hash32, older ones used
-# Private key/Public key. Normalize terminal control characters first and
-# parse by label without depending on awk field-separator behaviour.
-clean_xray_output() {
-  # Strip CR and common ANSI CSI escape sequences.
-  sed $'s/\r//g; s/\033\[[0-9;?]*[ -\/]*[@-~]//g'
+api_get() {
+  local path="$1"
+  curl -fsS --max-time 15 \
+    -H "Authorization: Bearer ${XUI_API_TOKEN}" \
+    -H 'Accept: application/json' \
+    "${API_BASE}${path}"
 }
 
-extract_xray_value() {
-  local labels_re="$1"
-  local input="$2"
-  printf '%s\n' "$input" \
-    | clean_xray_output \
-    | sed -nE "/^[[:space:]]*(${labels_re})[[:space:]]*:/I { s/^[^:]*:[[:space:]]*//; s/[[:space:]]+$//; p; }"
-}
+X25519_JSON="$(api_get '/panel/api/server/getNewX25519Cert')" \
+  || die "3x-ui API: не удалось сгенерировать X25519 ключи"
 
-valid_xray_key() {
-  [[ "$1" =~ ^[A-Za-z0-9_-]{20,}$ ]]
-}
-
-X25519_OUT="$("$XRAY" x25519 2>&1 || true)"
-PRIVATE_KEY="$(extract_xray_value 'PrivateKey|Private[[:space:]]+key' "$X25519_OUT")"
-PUBLIC_KEY="$(extract_xray_value 'Password|PublicKey|Public[[:space:]]+key' "$X25519_OUT")"
-
-if ! valid_xray_key "$PRIVATE_KEY" || ! valid_xray_key "$PUBLIC_KEY"; then
-  echo "xray x25519 labels:" >&2
-  printf '%s\n' "$X25519_OUT" | clean_xray_output | sed -E 's/^([^:]+):.*/  \1: <hidden>/' >&2
-  die "Не удалось распарсить xray x25519"
+if [[ "$(jq -r '.success // false' <<<"$X25519_JSON")" != "true" ]]; then
+  echo "$X25519_JSON" | jq . 2>/dev/null || echo "$X25519_JSON"
+  die "3x-ui API не сгенерировал X25519 ключи"
 fi
 
-MLDSA_OUT="$("$XRAY" mldsa65 2>&1 || true)"
-MLDSA_SEED="$(extract_xray_value 'Seed' "$MLDSA_OUT")"
-MLDSA_VERIFY="$(extract_xray_value 'Verify' "$MLDSA_OUT")"
-if ! valid_xray_key "$MLDSA_SEED" || ! valid_xray_key "$MLDSA_VERIFY"; then
-  echo "xray mldsa65 labels:" >&2
-  printf '%s\n' "$MLDSA_OUT" | clean_xray_output | sed -E 's/^([^:]+):.*/  \1: <hidden>/' >&2
-  die "Не удалось распарсить xray mldsa65"
+PRIVATE_KEY="$(jq -r '.obj.privateKey // empty' <<<"$X25519_JSON")"
+PUBLIC_KEY="$(jq -r '.obj.publicKey // empty' <<<"$X25519_JSON")"
+
+if [[ ${#PRIVATE_KEY} -ne 43 || ${#PUBLIC_KEY} -ne 43 ]]; then
+  echo "3x-ui X25519 API diagnostics:" >&2
+  echo "  privateKey length: ${#PRIVATE_KEY}" >&2
+  echo "  publicKey length: ${#PUBLIC_KEY}" >&2
+  die "Некорректный ответ getNewX25519Cert"
 fi
+ok "X25519 ключи сгенерированы через 3x-ui API"
+
+MLDSA_JSON="$(api_get '/panel/api/server/getNewmldsa65')" \
+  || die "3x-ui API: не удалось сгенерировать ML-DSA-65 ключи"
+
+if [[ "$(jq -r '.success // false' <<<"$MLDSA_JSON")" != "true" ]]; then
+  echo "$MLDSA_JSON" | jq . 2>/dev/null || echo "$MLDSA_JSON"
+  die "3x-ui API не сгенерировал ML-DSA-65 ключи"
+fi
+
+MLDSA_SEED="$(jq -r '.obj.seed // empty' <<<"$MLDSA_JSON")"
+MLDSA_VERIFY="$(jq -r '.obj.verify // empty' <<<"$MLDSA_JSON")"
+
+if [[ -z "$MLDSA_SEED" || -z "$MLDSA_VERIFY" ]]; then
+  echo "3x-ui ML-DSA-65 API diagnostics:" >&2
+  echo "  seed length: ${#MLDSA_SEED}" >&2
+  echo "  verify length: ${#MLDSA_VERIFY}" >&2
+  die "Некорректный ответ getNewmldsa65"
+fi
+ok "ML-DSA-65 ключи сгенерированы через 3x-ui API"
 
 SHORT_ID="$(openssl rand -hex 2)"
 CLIENT_EMAIL="client-$(openssl rand -hex 3)"
@@ -228,10 +238,6 @@ if [[ -n "${INBOUND_PORT:-}" ]]; then
 else
   INBOUND_PORT="$(random_free_port)" || die "Не удалось подобрать свободный inbound port"
 fi
-
-BASE_PATH="${XUI_WEB_BASE_PATH#/}"
-BASE_PATH="${BASE_PATH%/}"
-API_BASE="http://127.0.0.1:${XUI_PANEL_PORT}/${BASE_PATH}"
 
 log "Создаю VLESS + XHTTP + REALITY inbound на порту ${INBOUND_PORT}"
 PAYLOAD="$(jq -nc \
