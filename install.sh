@@ -286,7 +286,7 @@ PAYLOAD="$(jq -nc \
         totalGB: 0,
         expiryTime: 0,
         enable: true,
-        tgId: "",
+        tgId: 0,
         subId: "",
         reset: 0
       }],
