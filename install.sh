@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+SCRIPT_VERSION="v8"
 
 # ------------------------------------------------------------
-# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v6)
+# 3x-ui + VLESS + XHTTP + REALITY + ML-DSA-65 installer (v8)
 # Ubuntu / Debian, fresh VPS recommended.
 #
 # Optional environment variables:
@@ -44,6 +45,7 @@ case "${ID:-}" in
   *) die "Эта версия скрипта рассчитана на Ubuntu/Debian. Обнаружено: ${ID:-unknown}" ;;
 esac
 
+log "Версия установщика: ${SCRIPT_VERSION}"
 XUI_ALREADY_INSTALLED=0
 if [[ -e /etc/x-ui/x-ui.db || -x "$XUI_BIN" ]]; then
   XUI_ALREADY_INSTALLED=1
